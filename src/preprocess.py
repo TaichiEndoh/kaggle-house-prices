@@ -19,6 +19,31 @@ TARGET = "SalePrice"
 # この値より歪度(skew)が大きい数値列は log1p で変換する
 SKEW_THRESHOLD = 0.75
 
+# 品質・状態を表すカテゴリ列。文字の等級には明確な順序があるため、
+# ワンホットではなく順序を保った数値(0〜5)に変換すると効きやすい。
+QUALITY_MAP = {"None": 0, "Po": 1, "Fa": 2, "TA": 3, "Gd": 4, "Ex": 5}
+QUALITY_COLS = [
+    "ExterQual",
+    "ExterCond",
+    "BsmtQual",
+    "BsmtCond",
+    "HeatingQC",
+    "KitchenQual",
+    "FireplaceQu",
+    "GarageQual",
+    "GarageCond",
+    "PoolQC",
+]
+
+
+def encode_quality(df: pd.DataFrame) -> pd.DataFrame:
+    """品質・状態の等級(Po〜Ex)を順序付きの数値に変換する。"""
+    df = df.copy()
+    for col in QUALITY_COLS:
+        if col in df.columns:
+            df[col] = df[col].map(QUALITY_MAP).fillna(0).astype(int)
+    return df
+
 
 def remove_outliers(train: pd.DataFrame) -> pd.DataFrame:
     """学習データから明らかな外れ値を取り除く。
@@ -140,13 +165,17 @@ def preprocess(
     X_train = train.drop(columns=[TARGET, "Id"])
     X_test = test.drop(columns=["Id"])
 
-    # 特徴量づくり → 欠損値補完 の順で処理
+    # 特徴量づくり → 欠損値補完 の順で処理。
+    # (品質等級の順序エンコード encode_quality は CV が悪化したため不採用。
+    #  one-hot のままの方が線形モデルの精度が良かった。)
     X_train = fill_missing(add_features(X_train))
     X_test = fill_missing(add_features(X_test))
 
     # 歪みの大きい数値列を log1p で変換する。
     # 補正対象は学習データの歪度を基準に決め、test にも同じ列を適用する。
     numeric_cols = X_train.select_dtypes(include=[np.number]).columns
+    # 順序エンコードした品質列(0〜5)は対数変換しない
+    numeric_cols = [c for c in numeric_cols if c not in QUALITY_COLS]
     skewness = X_train[numeric_cols].skew()
     skewed_cols = skewness[skewness.abs() > SKEW_THRESHOLD].index.tolist()
     X_train = fix_skew(X_train, skewed_cols)

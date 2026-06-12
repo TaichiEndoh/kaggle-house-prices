@@ -2,10 +2,10 @@
 
 処理の流れ:
   1. data/ から train.csv / test.csv を読み込む
-  2. preprocess.py で前処理する(外れ値除去・特徴量づくり・歪度補正)
-  3. 複数モデル(XGBoost / GradientBoosting / Lasso / Ridge)を学習する
-  4. 交差検証(クロスバリデーション)で各モデルとブレンドの RMSE を確認する
-  5. 各モデルの予測を平均(ブレンド)して submission.csv に書き出す
+  2. preprocess.py で前処理する(外れ値除去・特徴量づくり・品質順序エンコード・歪度補正)
+  3. 複数モデル(XGBoost / LightGBM / GradientBoosting / Lasso / Ridge)を学習する
+  4. 交差検証で各モデル・ブレンド・スタッキングの RMSE を比較する
+  5. CV が最も良い方式で test を予測し、submission.csv に書き出す
 
 使い方:
   python src/train.py
@@ -15,7 +15,8 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import GradientBoostingRegressor
+from lightgbm import LGBMRegressor
+from sklearn.ensemble import GradientBoostingRegressor, StackingRegressor
 from sklearn.linear_model import Lasso, Ridge
 from sklearn.model_selection import KFold, cross_val_score
 from sklearn.pipeline import make_pipeline
@@ -49,8 +50,8 @@ def load_data() -> tuple[pd.DataFrame, pd.DataFrame]:
     return train, test
 
 
-def build_models() -> dict:
-    """ブレンドに使うモデル群を作る。
+def build_base_models() -> dict:
+    """ブレンド / スタッキングに使うベースモデル群を作る。
 
     線形モデル(Lasso / Ridge)はスケールの影響を受けやすいため、
     外れ値に強い RobustScaler を前段に挟んだパイプラインにする。
@@ -67,6 +68,18 @@ def build_models() -> dict:
             random_state=42,
             n_jobs=-1,
         ),
+        "lgb": LGBMRegressor(
+            n_estimators=2000,
+            learning_rate=0.02,
+            num_leaves=15,
+            subsample=0.7,
+            colsample_bytree=0.7,
+            reg_alpha=0.1,
+            reg_lambda=1.0,
+            random_state=42,
+            n_jobs=-1,
+            verbose=-1,
+        ),
         "gbr": GradientBoostingRegressor(
             n_estimators=1500,
             learning_rate=0.02,
@@ -79,10 +92,47 @@ def build_models() -> dict:
     }
 
 
+def build_stack() -> StackingRegressor:
+    """ベースモデルを Lasso メタモデルでまとめるスタッキングモデルを作る。"""
+    base = list(build_base_models().items())
+    return StackingRegressor(
+        estimators=base,
+        final_estimator=make_pipeline(
+            RobustScaler(), Lasso(alpha=0.0005, max_iter=10000)
+        ),
+        cv=KF,
+        n_jobs=-1,
+    )
+
+
 def cv_rmse(model, X, y) -> np.ndarray:
     """交差検証で RMSE(log スケール)を計算する。"""
     neg_mse = cross_val_score(model, X, y, cv=KF, scoring="neg_mean_squared_error")
     return np.sqrt(-neg_mse)
+
+
+def blend_cv(X, y) -> np.ndarray:
+    """ベースモデルの単純平均(ブレンド)の交差検証 RMSE を計算する。"""
+    scores = []
+    for tr_idx, va_idx in KF.split(X):
+        X_tr, X_va = X.iloc[tr_idx], X.iloc[va_idx]
+        y_tr, y_va = y.iloc[tr_idx], y.iloc[va_idx]
+        preds = []
+        for model in build_base_models().values():
+            model.fit(X_tr, y_tr)
+            preds.append(model.predict(X_va))
+        blend_pred = np.mean(preds, axis=0)
+        scores.append(np.sqrt(np.mean((blend_pred - y_va) ** 2)))
+    return np.array(scores)
+
+
+def blend_predict(X_train, y_train, X_test) -> np.ndarray:
+    """全データで各ベースモデルを学習し、平均した予測(log スケール)を返す。"""
+    preds = []
+    for model in build_base_models().values():
+        model.fit(X_train, y_train)
+        preds.append(model.predict(X_test))
+    return np.mean(preds, axis=0)
 
 
 def main() -> None:
@@ -95,38 +145,30 @@ def main() -> None:
     print(f"前処理後の特徴量数: {X_train.shape[1]}")
 
     # 住宅価格は分布が右に偏っているため log を取ってから学習する。
-    # (Kaggle の評価指標も「価格の log の RMSE」なので相性が良い)
     y_train_log = np.log1p(y_train)
 
-    # 3. モデル定義
-    models = build_models()
-
-    # 4. 各モデルを交差検証して RMSE を確認する
+    # 3-4. 各方式を交差検証して RMSE を比較する
     print("\n--- 交差検証 RMSE(log スケール、5分割) ---")
-    for name, model in models.items():
-        scores = cv_rmse(model, X_train, y_train_log)
-        print(f"  {name:6s}: {scores.mean():.4f} (+/- {scores.std():.4f})")
+    for name, model in build_base_models().items():
+        s = cv_rmse(model, X_train, y_train_log)
+        print(f"  {name:6s}: {s.mean():.4f} (+/- {s.std():.4f})")
 
-    # ブレンド(各モデルの予測を単純平均)の交差検証スコアを手動で算出する
-    blend_scores = []
-    for tr_idx, va_idx in KF.split(X_train):
-        X_tr, X_va = X_train.iloc[tr_idx], X_train.iloc[va_idx]
-        y_tr, y_va = y_train_log.iloc[tr_idx], y_train_log.iloc[va_idx]
-        preds = []
-        for model in build_models().values():
-            model.fit(X_tr, y_tr)
-            preds.append(model.predict(X_va))
-        blend_pred = np.mean(preds, axis=0)
-        blend_scores.append(np.sqrt(np.mean((blend_pred - y_va) ** 2)))
-    blend_scores = np.array(blend_scores)
-    print(f"  blend : {blend_scores.mean():.4f} (+/- {blend_scores.std():.4f})  <- 提出に使用")
+    blend_s = blend_cv(X_train, y_train_log)
+    print(f"  blend : {blend_s.mean():.4f} (+/- {blend_s.std():.4f})")
 
-    # 5. 全データで学習し、test を予測する(各モデルの平均をとる)
-    test_preds = []
-    for model in models.values():
-        model.fit(X_train, y_train_log)
-        test_preds.append(model.predict(X_test))
-    pred_log = np.mean(test_preds, axis=0)
+    stack_s = cv_rmse(build_stack(), X_train, y_train_log)
+    print(f"  stack : {stack_s.mean():.4f} (+/- {stack_s.std():.4f})")
+
+    # 5. CV が良い方を採用して test を予測する
+    if stack_s.mean() <= blend_s.mean():
+        print(f"\n=> stack を採用(CV {stack_s.mean():.4f})")
+        stack = build_stack()
+        stack.fit(X_train, y_train_log)
+        pred_log = stack.predict(X_test)
+    else:
+        print(f"\n=> blend を採用(CV {blend_s.mean():.4f})")
+        pred_log = blend_predict(X_train, y_train_log, X_test)
+
     pred = np.expm1(pred_log)  # log を元のスケール(価格)に戻す
 
     # 6. 提出ファイルを作成する
