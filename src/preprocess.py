@@ -1,178 +1,181 @@
-"""データの前処理を行うモジュール。
+"""データの前処理を行うモジュール(本格版)。
 
-House Prices コンペ向けに、以下の処理をまとめています。
+House Prices コンペで上位ノートが使う定番の前処理をまとめている。
   - 外れ値の除去(学習データのみ)
-  - 欠損値の処理(数値列・カテゴリ列)
-  - 特徴量づくり(家の築年数や合計面積など)
-  - 歪んだ数値列の対数変換(skew の大きい列を log1p)
-  - カテゴリ変数のエンコード(ワンホットエンコーディング)
+  - 列ごとの意味を踏まえた欠損値補完(「設備なし」は None、数量系は 0、ほかは最頻値)
+  - 近隣(Neighborhood)別の LotFrontage 補完
+  - 数値だが実体はカテゴリの列を文字列化
+  - 順序のある品質・状態カテゴリのラベルエンコード
+  - 合計床面積などの特徴量づくり
+  - 歪んだ数値列の Box-Cox 変換
+  - 残りのカテゴリ変数のワンホットエンコード
 
-train と test を同じルールで処理できるように、まとめて関数化しています。
+train / test を結合してから同じルールで処理し、最後に分け直す。
+(列のずれを防ぎ、エンコードを揃えるため。上位ノートでも一般的なやり方。)
 """
 
 import numpy as np
 import pandas as pd
+from scipy.special import boxcox1p
+from sklearn.preprocessing import LabelEncoder
 
 # 予測したい目的変数(住宅価格)
 TARGET = "SalePrice"
 
-# この値より歪度(skew)が大きい数値列は log1p で変換する
+# この値より歪度(skew)が大きい数値列は Box-Cox 変換する
 SKEW_THRESHOLD = 0.75
+BOXCOX_LAMBDA = 0.15
 
-# 品質・状態を表すカテゴリ列。文字の等級には明確な順序があるため、
-# ワンホットではなく順序を保った数値(0〜5)に変換すると効きやすい。
-QUALITY_MAP = {"None": 0, "Po": 1, "Fa": 2, "TA": 3, "Gd": 4, "Ex": 5}
-QUALITY_COLS = [
-    "ExterQual",
-    "ExterCond",
-    "BsmtQual",
-    "BsmtCond",
-    "HeatingQC",
-    "KitchenQual",
-    "FireplaceQu",
-    "GarageQual",
-    "GarageCond",
-    "PoolQC",
+# 欠損が「その設備が無い」を意味する列 → "None" で補完
+NONE_COLS = [
+    "PoolQC", "MiscFeature", "Alley", "Fence", "FireplaceQu",
+    "GarageType", "GarageFinish", "GarageQual", "GarageCond",
+    "BsmtQual", "BsmtCond", "BsmtExposure", "BsmtFinType1", "BsmtFinType2",
+    "MasVnrType",
+]
+# 欠損が「数量ゼロ」を意味する列 → 0 で補完
+ZERO_COLS = [
+    "GarageYrBlt", "GarageArea", "GarageCars",
+    "BsmtFinSF1", "BsmtFinSF2", "BsmtUnfSF", "TotalBsmtSF",
+    "BsmtFullBath", "BsmtHalfBath", "MasVnrArea",
+]
+# 欠損を最頻値で補完する列
+MODE_COLS = [
+    "MSZoning", "Electrical", "KitchenQual",
+    "Exterior1st", "Exterior2nd", "SaleType",
+]
+# 数値で入っているが実体はカテゴリ(順序に意味が無い)列 → 文字列化
+TO_STRING_COLS = ["MSSubClass", "OverallCond", "YrSold", "MoSold"]
+# 順序のある品質・状態カテゴリ → ラベルエンコード(整数化)
+LABEL_COLS = [
+    "FireplaceQu", "BsmtQual", "BsmtCond", "GarageQual", "GarageCond",
+    "ExterQual", "ExterCond", "HeatingQC", "PoolQC", "KitchenQual",
+    "BsmtFinType1", "BsmtFinType2", "Functional", "Fence", "BsmtExposure",
+    "GarageFinish", "LandSlope", "LotShape", "PavedDrive", "Street", "Alley",
+    "CentralAir", "MSSubClass", "OverallCond", "YrSold", "MoSold",
 ]
 
 
-def encode_quality(df: pd.DataFrame) -> pd.DataFrame:
-    """品質・状態の等級(Po〜Ex)を順序付きの数値に変換する。"""
-    df = df.copy()
-    for col in QUALITY_COLS:
-        if col in df.columns:
-            df[col] = df[col].map(QUALITY_MAP).fillna(0).astype(int)
-    return df
-
-
 def remove_outliers(train: pd.DataFrame) -> pd.DataFrame:
-    """学習データから明らかな外れ値を取り除く。
-
-    House Prices コンペで有名な外れ値として、
-    「居住面積(GrLivArea)が非常に大きいのに価格が安い」物件があります。
-    これらは回帰モデルの学習を歪めるため除外します。
-    """
+    """学習データから明らかな外れ値(広いのに激安な物件)を取り除く。"""
     if {"GrLivArea", TARGET}.issubset(train.columns):
         mask = ~((train["GrLivArea"] > 4000) & (train[TARGET] < 300000))
-        removed = (~mask).sum()
+        removed = int((~mask).sum())
         if removed:
             print(f"外れ値を {removed} 件除去しました。")
         return train[mask].reset_index(drop=True)
     return train
 
 
-def add_features(df: pd.DataFrame) -> pd.DataFrame:
-    """既存の列を組み合わせて、予測に役立つ新しい列を作る。"""
+def fill_missing(df: pd.DataFrame) -> pd.DataFrame:
+    """列の意味に応じて欠損値を補完する。"""
     df = df.copy()
 
-    # 家全体の床面積(地下 + 1階 + 2階)
-    if {"TotalBsmtSF", "1stFlrSF", "2ndFlrSF"}.issubset(df.columns):
-        df["TotalSF"] = df["TotalBsmtSF"].fillna(0) + df["1stFlrSF"] + df["2ndFlrSF"]
+    for col in NONE_COLS:
+        if col in df.columns:
+            df[col] = df[col].fillna("None")
 
-    # 築年数(販売年 - 建築年)とリフォームからの経過年数
-    if {"YrSold", "YearBuilt"}.issubset(df.columns):
-        df["HouseAge"] = df["YrSold"] - df["YearBuilt"]
-    if {"YrSold", "YearRemodAdd"}.issubset(df.columns):
-        df["SinceRemodel"] = df["YrSold"] - df["YearRemodAdd"]
+    for col in ZERO_COLS:
+        if col in df.columns:
+            df[col] = df[col].fillna(0)
 
-    # バスルームの合計数(地上 + 地下、半分のバスは0.5として数える)
-    bath_cols = {"FullBath", "HalfBath", "BsmtFullBath", "BsmtHalfBath"}
-    if bath_cols.issubset(df.columns):
-        df["TotalBath"] = (
-            df["FullBath"].fillna(0)
-            + 0.5 * df["HalfBath"].fillna(0)
-            + df["BsmtFullBath"].fillna(0)
-            + 0.5 * df["BsmtHalfBath"].fillna(0)
+    # LotFrontage(間口)は近隣ごとの中央値で補完
+    if {"LotFrontage", "Neighborhood"}.issubset(df.columns):
+        df["LotFrontage"] = df.groupby("Neighborhood")["LotFrontage"].transform(
+            lambda s: s.fillna(s.median())
         )
 
-    # ポーチ・デッキ面積の合計
-    porch_cols = {
-        "OpenPorchSF",
-        "EnclosedPorch",
-        "3SsnPorch",
-        "ScreenPorch",
-        "WoodDeckSF",
-    }
-    if porch_cols.issubset(df.columns):
-        df["TotalPorchSF"] = sum(df[c].fillna(0) for c in porch_cols)
+    # Functional は欠損なら "Typ"(標準的)とみなす
+    if "Functional" in df.columns:
+        df["Functional"] = df["Functional"].fillna("Typ")
 
-    # 各種設備の「あり / なし」を表すフラグ
-    if "PoolArea" in df.columns:
-        df["HasPool"] = (df["PoolArea"].fillna(0) > 0).astype(int)
-    if "GarageArea" in df.columns:
-        df["HasGarage"] = (df["GarageArea"].fillna(0) > 0).astype(int)
-    if "TotalBsmtSF" in df.columns:
-        df["HasBsmt"] = (df["TotalBsmtSF"].fillna(0) > 0).astype(int)
-    if "Fireplaces" in df.columns:
-        df["HasFireplace"] = (df["Fireplaces"].fillna(0) > 0).astype(int)
+    for col in MODE_COLS:
+        if col in df.columns:
+            df[col] = df[col].fillna(df[col].mode()[0])
+
+    # 情報量の無い列は削除(ほぼ全行が同じ値)
+    if "Utilities" in df.columns:
+        df = df.drop(columns=["Utilities"])
+
+    # 取りこぼした欠損の保険(数値=中央値 / カテゴリ="None")
+    for col in df.columns:
+        if df[col].isnull().any():
+            if df[col].dtype.kind in "biufc":
+                df[col] = df[col].fillna(df[col].median())
+            else:
+                df[col] = df[col].fillna("None")
 
     return df
 
 
-# 数値で入っているが実体はカテゴリ(順序に意味が無い)列。
-# 文字列化してから one-hot にすると、誤った大小関係を学習させずに済む。
-CATEGORICAL_AS_STRING = ["MSSubClass", "MoSold"]
-
-
-def cast_categorical(df: pd.DataFrame) -> pd.DataFrame:
-    """数値だが実体はカテゴリの列を文字列に変換する。
-
-    MSSubClass(住宅種別コード)や MoSold(売却月)は数値で入っているが、
-    値の大小に意味は無いため、文字列にして one-hot エンコードの対象にする。
-    """
+def add_features(df: pd.DataFrame) -> pd.DataFrame:
+    """予測に役立つ特徴量を追加する。"""
     df = df.copy()
-    for col in CATEGORICAL_AS_STRING:
+
+    # 家全体の床面積(地下 + 1階 + 2階)。最も効く特徴量の一つ。
+    if {"TotalBsmtSF", "1stFlrSF", "2ndFlrSF"}.issubset(df.columns):
+        df["TotalSF"] = df["TotalBsmtSF"] + df["1stFlrSF"] + df["2ndFlrSF"]
+
+    # バスルームの合計数(半分のバスは 0.5)
+    bath_cols = {"FullBath", "HalfBath", "BsmtFullBath", "BsmtHalfBath"}
+    if bath_cols.issubset(df.columns):
+        df["TotalBath"] = (
+            df["FullBath"] + 0.5 * df["HalfBath"]
+            + df["BsmtFullBath"] + 0.5 * df["BsmtHalfBath"]
+        )
+
+    # ポーチ・デッキ面積の合計
+    porch_cols = {
+        "OpenPorchSF", "EnclosedPorch", "3SsnPorch", "ScreenPorch", "WoodDeckSF",
+    }
+    if porch_cols.issubset(df.columns):
+        df["TotalPorchSF"] = sum(df[c] for c in porch_cols)
+
+    # 各種設備の「あり / なし」フラグ
+    if "PoolArea" in df.columns:
+        df["HasPool"] = (df["PoolArea"] > 0).astype(int)
+    if "GarageArea" in df.columns:
+        df["HasGarage"] = (df["GarageArea"] > 0).astype(int)
+    if "TotalBsmtSF" in df.columns:
+        df["HasBsmt"] = (df["TotalBsmtSF"] > 0).astype(int)
+    if "Fireplaces" in df.columns:
+        df["HasFireplace"] = (df["Fireplaces"] > 0).astype(int)
+    if "2ndFlrSF" in df.columns:
+        df["Has2ndFloor"] = (df["2ndFlrSF"] > 0).astype(int)
+
+    # (主要ドライバの多項式・交互作用特徴も試したが、Box-Cox 済みの
+    #  元特徴と冗長で CV が悪化したため不採用。)
+
+    return df
+
+
+def to_string(df: pd.DataFrame) -> pd.DataFrame:
+    """数値だが実体はカテゴリの列を文字列に変換する。"""
+    df = df.copy()
+    for col in TO_STRING_COLS:
         if col in df.columns:
             df[col] = df[col].astype(str)
     return df
 
 
-def impute_lot_frontage(df: pd.DataFrame) -> pd.DataFrame:
-    """LotFrontage(間口)を近隣(Neighborhood)ごとの中央値で補完する。
-
-    間口は同じ近隣の物件どうしで似る傾向が強いため、
-    全体の中央値よりも近隣グループの中央値で埋める方が実態に近い。
-    """
+def label_encode(df: pd.DataFrame) -> pd.DataFrame:
+    """順序のある品質・状態カテゴリを整数に変換する。"""
     df = df.copy()
-    if {"LotFrontage", "Neighborhood"}.issubset(df.columns):
-        df["LotFrontage"] = df.groupby("Neighborhood")["LotFrontage"].transform(
-            lambda s: s.fillna(s.median())
-        )
-        # 近隣内が全て欠損だった場合に備え、残りは全体中央値で補完
-        if df["LotFrontage"].isnull().any():
-            df["LotFrontage"] = df["LotFrontage"].fillna(df["LotFrontage"].median())
-    return df
-
-
-def fill_missing(df: pd.DataFrame) -> pd.DataFrame:
-    """欠損値を埋める。
-
-    - 数値列: 中央値(median)で補完
-    - カテゴリ列: 文字列 "None" で補完(「該当なし」を意味することが多いため)
-    """
-    df = df.copy()
-
-    numeric_cols = df.select_dtypes(include=[np.number]).columns
-    categorical_cols = df.select_dtypes(include=["object"]).columns
-
-    for col in numeric_cols:
-        if df[col].isnull().any():
-            df[col] = df[col].fillna(df[col].median())
-
-    for col in categorical_cols:
-        if df[col].isnull().any():
-            df[col] = df[col].fillna("None")
-
-    return df
-
-
-def fix_skew(df: pd.DataFrame, skewed_cols: list[str]) -> pd.DataFrame:
-    """歪んだ数値列を log1p で変換し、分布を正規分布に近づける。"""
-    df = df.copy()
-    for col in skewed_cols:
+    for col in LABEL_COLS:
         if col in df.columns:
-            # log1p は負値に使えないため、念のため下限を0にクリップ
-            df[col] = np.log1p(df[col].clip(lower=0))
+            le = LabelEncoder()
+            df[col] = le.fit_transform(df[col].astype(str))
+    return df
+
+
+def fix_skew(df: pd.DataFrame) -> pd.DataFrame:
+    """歪んだ数値列を Box-Cox 変換して分布を正規分布に近づける。"""
+    df = df.copy()
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    skewness = df[numeric_cols].apply(lambda s: s.skew()).abs()
+    skewed_cols = skewness[skewness > SKEW_THRESHOLD].index
+    for col in skewed_cols:
+        df[col] = boxcox1p(df[col].clip(lower=0), BOXCOX_LAMBDA)
     return df
 
 
@@ -190,40 +193,27 @@ def preprocess(
     # 外れ値を除去(学習データのみ)
     train = remove_outliers(train)
 
-    # 目的変数を取り出す
     y_train = train[TARGET].copy()
-
-    # 提出時に必要な test の Id を保持しておく
     test_id = test["Id"].copy()
+    n_train = len(train)
 
-    # Id と目的変数は特徴量から除外する
-    X_train = train.drop(columns=[TARGET, "Id"])
-    X_test = test.drop(columns=["Id"])
+    # train / test を結合して同じルールで処理する
+    all_df = pd.concat(
+        [train.drop(columns=[TARGET]), test], axis=0, ignore_index=True
+    )
+    all_df = all_df.drop(columns=["Id"])
 
-    # 特徴量づくり → 欠損値補完 の順で処理。
-    # 不採用にした処理(呼び出していないが関数は残置):
-    #  - encode_quality: 品質等級の順序エンコード。CV が悪化したため不採用。
-    #  - cast_categorical / impute_lot_frontage: 数値カテゴリの文字列化と
-    #    近隣別 LotFrontage 補完。lasso CV は 0.1098→0.1099 で効果ゼロのため不採用。
-    X_train = fill_missing(add_features(X_train))
-    X_test = fill_missing(add_features(X_test))
+    # 欠損補完 → 特徴量づくり → 文字列化 → ラベルエンコード
+    #   → Box-Cox → ワンホット の順
+    all_df = fill_missing(all_df)
+    all_df = add_features(all_df)
+    all_df = to_string(all_df)
+    all_df = label_encode(all_df)
+    all_df = fix_skew(all_df)
+    all_df = pd.get_dummies(all_df)
 
-    # 歪みの大きい数値列を log1p で変換する。
-    # 補正対象は学習データの歪度を基準に決め、test にも同じ列を適用する。
-    numeric_cols = X_train.select_dtypes(include=[np.number]).columns
-    # 順序エンコードした品質列(0〜5)は対数変換しない
-    numeric_cols = [c for c in numeric_cols if c not in QUALITY_COLS]
-    skewness = X_train[numeric_cols].skew()
-    skewed_cols = skewness[skewness.abs() > SKEW_THRESHOLD].index.tolist()
-    X_train = fix_skew(X_train, skewed_cols)
-    X_test = fix_skew(X_test, skewed_cols)
-
-    # カテゴリ変数をワンホットエンコーディング(0/1 の列に変換)
-    X_train = pd.get_dummies(X_train)
-    X_test = pd.get_dummies(X_test)
-
-    # train と test で列がずれることがあるため、列をそろえる。
-    # test に無い列は 0 で埋め、test だけにある列は捨てる(train に合わせる)。
-    X_train, X_test = X_train.align(X_test, join="left", axis=1, fill_value=0)
+    # train / test に分け直す
+    X_train = all_df.iloc[:n_train].reset_index(drop=True)
+    X_test = all_df.iloc[n_train:].reset_index(drop=True)
 
     return X_train, y_train, X_test, test_id
