@@ -2,6 +2,8 @@
 # data/ 配下は除外しつつ、ディレクトリ自体は .gitkeep で残す
 data/*
 !data/.gitkeep
+# ROGII コンペのデータ置き場(ルール同意後にここへ展開)
+data_rogii/
 *.csv
 
 # Kaggle 認証情報(絶対にコミットしない)
