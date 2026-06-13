@@ -80,18 +80,31 @@ kaggle competitions submissions \
 `publicScore` を読み、CV スコアと比較する。
 CV と LB が大きく乖離していたら過学習/リークを疑う。
 
-## コード構成
+## コード構成(設定駆動の再利用テンプレート)
 
-- `src/preprocess.py` — 前処理を **fold 内 fit に対応した sklearn 変換器
-  `HousePreprocessor`** にまとめたもの。外れ値除去(`remove_outliers`、CV 外で1回)、
-  列ごとの欠損補完(設備なし=None / 数量=0 / その他=最頻値)、近隣別 LotFrontage 補完、
-  数値カテゴリの文字列化、ラベルエンコード、特徴量づくり、Box-Cox、ワンホットを
-  fit/transform で行う。**統計量は fit した fold からのみ学習** するので CV にリークが入らない。
-- `src/train.py` — 6モデルを「前処理 → (スケーリング) → モデル」の Pipeline にし、
-  `cross_val_predict` で OOF 予測を作成。NNLS で重みを学習し、**等重みへ収縮**させた
-  ブレンド(正則化スタッキング)で submission を作る。
-- `src/download_data.py` — Kaggle API でデータ取得。
-- `src/leak_submission.py` — リーク実演(教育用、後述)。
+他の表形式回帰コンペにも転用できるよう、**コンペ固有=2ファイル / 汎用=エンジン**に
+分離してある。使い方の詳細は `docs/TEMPLATE.md`。
+
+- `src/config.py` — ★コンペ固有の設定。スラッグ・TARGET/ID・LOG_TARGET・外れ値ルール・
+  欠損補完の列ロール(None/0/最頻値/固定値/グループ中央値/削除)・エンコード列・
+  Box-Cox 閾値・CV 分割・ブレンド収縮率。**転用時はここを書き換える。**
+- `src/features.py` — ★コンペ固有の特徴量づくり `add_features`。**転用時はここも。**
+- `src/preprocess.py` — 汎用前処理エンジン `TabularPreprocessor`(config 駆動)。
+  **統計量は fit した fold からのみ学習**するので CV にリークが入らない。コンペ非依存。
+- `src/models.py` — モデル動物園 `build_models()`(6モデルの Pipeline)。
+- `src/train.py` — 学習ドライバ。`cross_val_predict` で OOF を作り、`data/oof_cache.npz`
+  に保存してからブレンド・submission 作成。コンペ非依存。
+- `src/blend.py` — 保存済み OOF から**再学習なし(0.8秒)**で重みを再調整して submission
+  を作り直す。ブレンド方式の試行錯誤を効率化。
+- `src/download_data.py` — Kaggle API でデータ取得(スラッグは config 参照)。
+- `src/leak_submission.py` — リーク実演(教育用、後述。House Prices 専用)。
+
+### 効率化(実測)
+
+- **LightGBM は小データで `n_jobs=1`**：n_jobs=-1 だとスレッド競合で激遅
+  (CV1回 392秒 → 2.3秒、スコア不変)。これで全体 約7分 → **47秒(9倍速)**。
+- **OOF キャッシュ**：重み調整は `blend.py` で再学習なし(0.8秒)。
+- HistGradientBoosting は速いが CV 悪化(0.1257)で不採用 — 速さだけで選ばない。
 
 ## スコア改善の定石(伸ばしたいと言われたら)
 

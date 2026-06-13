@@ -15,12 +15,14 @@ import os
 import zipfile
 from pathlib import Path
 
+import config as cfg
+
 # このファイルから見たプロジェクトのルート(1つ上の階層)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
 
-# 対象コンペの識別子(Kaggle の URL 末尾の名前)
-COMPETITION = "house-prices-advanced-regression-techniques"
+# 対象コンペの識別子(config.py で一元管理)
+COMPETITION = cfg.COMPETITION
 
 
 def ensure_credentials() -> None:

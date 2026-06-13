@@ -7,13 +7,23 @@ Kaggle コンペ [House Prices - Advanced Regression Techniques](https://www.kag
 
 ## ディレクトリ構成
 
+設定駆動の再利用テンプレートになっています(他の表形式回帰コンペにも転用可)。
+コンペ固有なのは `config.py` と `features.py` の2ファイルだけ。詳細は
+[`docs/TEMPLATE.md`](docs/TEMPLATE.md)。
+
 ```
 kaggle-house-prices/
 ├── data/                  # 取得した CSV を置く場所(.gitignore で除外)
 ├── src/
+│   ├── config.py          # ★コンペ固有の設定(スラッグ/目的変数/欠損ルール 等)
+│   ├── features.py        # ★コンペ固有の特徴量づくり
+│   ├── preprocess.py      # 汎用前処理エンジン TabularPreprocessor(fold内fit)
+│   ├── models.py          # モデル動物園(6モデルの Pipeline)
+│   ├── train.py           # 学習 → OOF保存 → ブレンド → submission.csv
+│   ├── blend.py           # 保存済みOOFから重みだけ再調整(再学習なし・一瞬)
 │   ├── download_data.py   # Kaggle API でデータをダウンロード
-│   ├── preprocess.py      # 前処理(欠損値・エンコード・特徴量づくり)
-│   └── train.py           # 学習 → 交差検証 → submission.csv 作成
+│   └── leak_submission.py # 【教育用】データリーク実演(後述)
+├── docs/                  # 解説記事・上位手法分析・テンプレート使い方
 ├── requirements.txt       # 必要なライブラリ
 ├── .gitignore
 └── README.md
@@ -94,15 +104,25 @@ kaggle competitions submit \
 
 提出後、コンペページの「My Submissions」でスコア(Public Leaderboard)を確認できます。
 
-## このベースラインの中身
+### ブレンドだけ調整する(再学習なし・一瞬)
 
-- **前処理** (`src/preprocess.py`)
-  - 欠損値: 数値列は中央値、カテゴリ列は `"None"` で補完
-  - 特徴量づくり: 合計床面積・築年数・バスルーム合計数を追加
-  - カテゴリ変数: ワンホットエンコーディング
-- **モデル** (`src/train.py`)
-  - XGBoost(勾配ブースティング)による回帰
-  - 目的変数は `log1p` 変換してから学習(評価指標に合わせるため)
-  - 5 分割の交差検証でスコアを確認
+`train.py` は各モデルの予測を `data/oof_cache.npz` に保存します。ブレンドの重みや
+収縮率(`config.BLEND_SHRINK`)を変えて試すだけなら、再学習せず一瞬で回せます。
 
-ここからさらに、特徴量の追加やハイパーパラメータ調整、複数モデルのアンサンブルなどでスコアの改善を目指せます。
+```bash
+python src/blend.py
+```
+
+## 中身(現行パイプライン)
+
+- **前処理** (`src/preprocess.py` の `TabularPreprocessor`)
+  - 列の意味に応じた欠損補完(設備なし=None / 数量=0 / 最頻値 / グループ別中央値)
+  - 数値カテゴリの文字列化、順序カテゴリのラベルエンコード、ワンホット
+  - 歪んだ数値列の Box-Cox 変換、外れ値除去
+  - **fold 内でのみ fit** するため交差検証にリークが入らない(CV が信頼できる)
+- **モデル** (`src/models.py`) — Lasso / ElasticNet / KernelRidge / GradientBoosting /
+  XGBoost / LightGBM の6モデルを OOF 予測し、NNLS→等重み収縮でブレンド
+- 目的変数は `log1p` 変換してから学習(評価指標に合わせるため)
+
+到達点：honest CV ≈ 0.108 / Public LB ≈ 0.1223。
+スコアの読み方や上位手法の分析は [`docs/`](docs/) を参照。
