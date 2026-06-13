@@ -15,9 +15,9 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from lightgbm import LGBMRegressor
 from sklearn.ensemble import GradientBoostingRegressor, StackingRegressor
-from sklearn.linear_model import Lasso, Ridge
+from sklearn.kernel_ridge import KernelRidge
+from sklearn.linear_model import ElasticNet, Lasso, Ridge
 from sklearn.model_selection import KFold, cross_val_score
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import RobustScaler
@@ -53,8 +53,11 @@ def load_data() -> tuple[pd.DataFrame, pd.DataFrame]:
 def build_base_models() -> dict:
     """ブレンド / スタッキングに使うベースモデル群を作る。
 
-    線形モデル(Lasso / Ridge)はスケールの影響を受けやすいため、
-    外れ値に強い RobustScaler を前段に挟んだパイプラインにする。
+    線形・カーネル系モデル(Lasso / Ridge / ElasticNet / KernelRidge)は
+    スケールの影響を受けやすいため、外れ値に強い RobustScaler を前段に挟む。
+
+    このデータは線形モデルが強いので、弱かった LightGBM は外し、
+    代わりに強くて多様性のある ElasticNet / KernelRidge を加えている。
     """
     return {
         "xgb": XGBRegressor(
@@ -68,18 +71,6 @@ def build_base_models() -> dict:
             random_state=42,
             n_jobs=-1,
         ),
-        "lgb": LGBMRegressor(
-            n_estimators=2000,
-            learning_rate=0.02,
-            num_leaves=15,
-            subsample=0.7,
-            colsample_bytree=0.7,
-            reg_alpha=0.1,
-            reg_lambda=1.0,
-            random_state=42,
-            n_jobs=-1,
-            verbose=-1,
-        ),
         "gbr": GradientBoostingRegressor(
             n_estimators=1500,
             learning_rate=0.02,
@@ -89,6 +80,14 @@ def build_base_models() -> dict:
         ),
         "lasso": make_pipeline(RobustScaler(), Lasso(alpha=0.0005, max_iter=10000)),
         "ridge": make_pipeline(RobustScaler(), Ridge(alpha=10.0)),
+        "enet": make_pipeline(
+            RobustScaler(),
+            ElasticNet(alpha=0.0005, l1_ratio=0.9, max_iter=10000),
+        ),
+        "kr": make_pipeline(
+            RobustScaler(),
+            KernelRidge(alpha=0.6, kernel="polynomial", degree=2, coef0=2.5),
+        ),
     }
 
 

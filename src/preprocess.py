@@ -109,6 +109,41 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+# 数値で入っているが実体はカテゴリ(順序に意味が無い)列。
+# 文字列化してから one-hot にすると、誤った大小関係を学習させずに済む。
+CATEGORICAL_AS_STRING = ["MSSubClass", "MoSold"]
+
+
+def cast_categorical(df: pd.DataFrame) -> pd.DataFrame:
+    """数値だが実体はカテゴリの列を文字列に変換する。
+
+    MSSubClass(住宅種別コード)や MoSold(売却月)は数値で入っているが、
+    値の大小に意味は無いため、文字列にして one-hot エンコードの対象にする。
+    """
+    df = df.copy()
+    for col in CATEGORICAL_AS_STRING:
+        if col in df.columns:
+            df[col] = df[col].astype(str)
+    return df
+
+
+def impute_lot_frontage(df: pd.DataFrame) -> pd.DataFrame:
+    """LotFrontage(間口)を近隣(Neighborhood)ごとの中央値で補完する。
+
+    間口は同じ近隣の物件どうしで似る傾向が強いため、
+    全体の中央値よりも近隣グループの中央値で埋める方が実態に近い。
+    """
+    df = df.copy()
+    if {"LotFrontage", "Neighborhood"}.issubset(df.columns):
+        df["LotFrontage"] = df.groupby("Neighborhood")["LotFrontage"].transform(
+            lambda s: s.fillna(s.median())
+        )
+        # 近隣内が全て欠損だった場合に備え、残りは全体中央値で補完
+        if df["LotFrontage"].isnull().any():
+            df["LotFrontage"] = df["LotFrontage"].fillna(df["LotFrontage"].median())
+    return df
+
+
 def fill_missing(df: pd.DataFrame) -> pd.DataFrame:
     """欠損値を埋める。
 
@@ -166,8 +201,10 @@ def preprocess(
     X_test = test.drop(columns=["Id"])
 
     # 特徴量づくり → 欠損値補完 の順で処理。
-    # (品質等級の順序エンコード encode_quality は CV が悪化したため不採用。
-    #  one-hot のままの方が線形モデルの精度が良かった。)
+    # 不採用にした処理(呼び出していないが関数は残置):
+    #  - encode_quality: 品質等級の順序エンコード。CV が悪化したため不採用。
+    #  - cast_categorical / impute_lot_frontage: 数値カテゴリの文字列化と
+    #    近隣別 LotFrontage 補完。lasso CV は 0.1098→0.1099 で効果ゼロのため不採用。
     X_train = fill_missing(add_features(X_train))
     X_test = fill_missing(add_features(X_test))
 
