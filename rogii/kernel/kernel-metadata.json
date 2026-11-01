@@ -1,0 +1,14 @@
+{
+  "id": "dennkitotaichi/rogii-geosteer-late",
+  "title": "ROGII Geosteer Late",
+  "code_file": "rogii_geosteer.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_tpu": false,
+  "enable_internet": false,
+  "dataset_sources": [],
+  "competition_sources": ["rogii-wellbore-geology-prediction"],
+  "kernel_sources": []
+}
