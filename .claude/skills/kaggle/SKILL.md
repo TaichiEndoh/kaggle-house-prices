@@ -1,172 +1,99 @@
 ---
 name: kaggle
 description: >-
-  Run the end-to-end Kaggle workflow for this repository: check the environment
-  and network, install dependencies, download competition data, train the model
-  with cross-validation, write submission.csv, and (when asked) submit to Kaggle
-  and report the leaderboard score. Use whenever the user wants to "run the
-  baseline", "出して/提出して", iterate on the model, or check the latest
-  submission score for the House Prices competition.
+  Kaggle コンペを進めるための実戦プレイブック(表形式・コードコンペ・GPU 学習を含む)。
+  安全確認、コンペ選定、データ点検、検証設計、ベースライン、改善、提出(通常/コードコンペ/
+  Late Submission)、スコア確認、振り返りの記録までを扱う。House Prices と ROGII で得た
+  教訓と数値を参照ファイルに持つ。ユーザーが「Kaggle」「コンペ」「ベースライン出して」
+  「提出して」「スコア/順位確認」「CV」「LB」「Late Submission」「次のコンペ」「GPU で学習」
+  「Windows の GPU」「ROGII」「House Prices」などと言ったら使う。
 ---
 
-# Kaggle ワークフロー (House Prices)
+# Kaggle 実戦プレイブック
 
-このリポジトリで Kaggle コンペ
-`house-prices-advanced-regression-techniques` を回すための手順をまとめたスキル。
-ユーザーが「ベースライン出して」「提出して」「スコア確認して」「モデル改善して」
-などと言ったときに使う。
+House Prices(入門・表形式回帰)と ROGII(賞金付き・コードコンペ)を通して確立した型。
+コンペ固有の詳細は `references/` を読む。
 
-## 0. 前提の確認(毎回さっと確認する)
+## 0. 安全(最優先・毎回)
 
-```bash
-# Kaggle 認証(環境変数 or ~/.kaggle/kaggle.json のどちらか)
-env | grep -i kaggle            # KAGGLE_USERNAME / KAGGLE_KEY
-# ネットワーク到達性
-curl -sS -m 10 -o /dev/null -w "pypi:%{http_code}\n"  https://pypi.org/simple/
-curl -sS -m 10 -o /dev/null -w "kaggle:%{http_code}\n" https://www.kaggle.com/api/v1/
-```
+- **鍵の値を絶対に表示しない。** `env | grep kaggle` や `cat kaggle.json` は禁止
+  (2026-06 にこれで KAGGLE_KEY が会話ログに漏れた)。有無だけ確認する:
+  ```bash
+  [ -n "$KAGGLE_USERNAME" ] && echo "USERNAME: set"; [ -n "$KAGGLE_KEY" ] && echo "KEY: set"
+  [ -f ~/.kaggle/kaggle.json ] && echo "kaggle.json: あり"
+  kaggle competitions list -p 1 | head -2   # 認証が通るかだけ見る
+  ```
+- 鍵が漏れたら: kaggle.com/settings で **Expire** → 新しく作成 → 環境変数/設定欄に直接入れる
+  (チャットに貼らせない)。新しいセッションで反映を確認する。
+- ダウンロードしたデータは専用ディレクトリに置き、`.gitignore` に入れる。データ・鍵・
+  重いモデルはコミットしない。
 
-- どちらの認証情報も無ければ、設定方法(README 参照)を案内して止める。
-- ネットワークが届かない場合は、環境のネットワークポリシーを確認するよう案内する。
+## 1. コンペ選定と着手前チェック
 
-## 1. 依存インストール
-
-```bash
-pip install -r requirements.txt
-```
-
-依存は `pandas / numpy / scikit-learn / xgboost / kaggle` のみ。
-新しいモデルを足すとき(例: lightgbm)は requirements.txt も更新する。
-
-## 2. データ取得
-
-```bash
-python src/download_data.py
-```
-
-`data/` に `train.csv` / `test.csv` / `sample_submission.csv` を展開する。
-`data/` 配下と `*.csv` は .gitignore 済みなのでコミットされない。
-
-## 3. 学習 + 交差検証 + submission 作成
-
-```bash
-python src/train.py
-```
-
-- 5分割の交差検証で **RMSE(log スケール)** を表示する(小さいほど良い)。
-- ルート直下に `submission.csv` を書き出す(1459 行 + ヘッダ)。
-- 評価指標は「価格の log の RMSE」。目的変数は `np.log1p` で学習し、
-  予測は `np.expm1` で戻す。
-
-## 4. Kaggle へ提出(ユーザーが明示的に頼んだときだけ)
-
-```bash
-kaggle competitions submit \
-  -c house-prices-advanced-regression-techniques \
-  -f submission.csv -m "<何をしたか + CV スコア>"
-```
-
-提出は外向きの操作。ユーザーが「提出して」と明示したときのみ実行する。
-メッセージには「手法 + CV RMSE」を入れておくと履歴で追える。
-
-## 5. スコア確認
-
-```bash
-sleep 8   # 採点に少し時間がかかる
-kaggle competitions submissions \
-  -c house-prices-advanced-regression-techniques | head
-```
-
-`publicScore` を読み、CV スコアと比較する。
-CV と LB が大きく乖離していたら過学習/リークを疑う。
-
-## コード構成(設定駆動の再利用テンプレート)
-
-他の表形式回帰コンペにも転用できるよう、**コンペ固有=2ファイル / 汎用=エンジン**に
-分離してある。使い方の詳細は `docs/TEMPLATE.md`。
-
-- `src/config.py` — ★コンペ固有の設定。スラッグ・TARGET/ID・LOG_TARGET・外れ値ルール・
-  欠損補完の列ロール(None/0/最頻値/固定値/グループ中央値/削除)・エンコード列・
-  Box-Cox 閾値・CV 分割・ブレンド収縮率。**転用時はここを書き換える。**
-- `src/features.py` — ★コンペ固有の特徴量づくり `add_features`。**転用時はここも。**
-- `src/preprocess.py` — 汎用前処理エンジン `TabularPreprocessor`(config 駆動)。
-  **統計量は fit した fold からのみ学習**するので CV にリークが入らない。コンペ非依存。
-- `src/models.py` — モデル動物園 `build_models()`(6モデルの Pipeline)。
-- `src/train.py` — 学習ドライバ。`cross_val_predict` で OOF を作り、`data/oof_cache.npz`
-  に保存してからブレンド・submission 作成。コンペ非依存。
-- `src/blend.py` — 保存済み OOF から**再学習なし(0.8秒)**で重みを再調整して submission
-  を作り直す。ブレンド方式の試行錯誤を効率化。
-- `src/download_data.py` — Kaggle API でデータ取得(スラッグは config 参照)。
-- `src/leak_submission.py` — リーク実演(教育用、後述。House Prices 専用)。
-
-### 効率化(実測)
-
-- **LightGBM は小データで `n_jobs=1`**：n_jobs=-1 だとスレッド競合で激遅
-  (CV1回 392秒 → 2.3秒、スコア不変)。これで全体 約7分 → **47秒(9倍速)**。
-- **OOF キャッシュ**：重み調整は `blend.py` で再学習なし(0.8秒)。
-- HistGradientBoosting は速いが CV 悪化(0.1257)で不採用 — 速さだけで選ばない。
-
-## スコア改善の定石(伸ばしたいと言われたら)
-
-効果が出やすい順(いずれも実装済み):
-
-1. **外れ値除去** — `GrLivArea > 4000 かつ 価格が安い` 物件を学習から除外。
-2. **目的変数の log 変換** + **歪んだ数値列の Box-Cox(λ=0.15)**。
-3. **列ごとの意味を踏まえた欠損補完**(None / 0 / 最頻値 / 近隣別中央値)。
-4. **強い6モデルのブレンド** — Lasso / ElasticNet / KernelRidge / GradientBoosting /
-   XGBoost / LightGBM。このデータは線形・カーネル系が強い。NNLS で重みを学習し、
-   過適合を避けるため等重みへ収縮(`SHRINK`)させる。
-5. **ハイパーパラメータ調整** — 効果は逓減。
-
-変更したら必ず `python src/train.py` で **信頼できる CV** を見て判断する。
-CV が改善しない変更は採用しない。
-
-### 検証は fold 内 fit(リークなし)
-
-前処理は `HousePreprocessor` で fold 内 fit されるため、CV は信頼できる。
-過去に train/test 結合で前処理していた頃は CV が 0.001 ほど楽観的に出ていた
-(例: leaky lasso 0.1098 → honest 0.1111)。改善判断は honest CV で行う。
-
-### 試したが不採用(知見)
-
-House Prices で定番とされる手法でも、このパイプラインでは効かないことが多い。
-
-- **多項式・交互作用特徴**(OverallQual² / TotalSF² / Qual×TotalSF など)— Box-Cox 済みの
-  元特徴と冗長で CV 悪化。
-- **築年数系特徴**(HouseAge / RemodAge / IsNew / IsRemodeled)— 年次列が既に情報を
-  持っており honest CV 不変(lasso/enet とも 0.1111)。
-- **ブレンド重みの工夫**(NNLS / 等重み / 収縮)— CV は多少動くが **LB はいずれも ≈0.1223**
-  で不動。重み付けでは LB は変わらない。
-
-### 到達点と限界(重要)
-
-- honest CV ≈ **0.108** / Public LB ≈ **0.1223** が正攻法の堅牢な底。
-- **残差分析で、残差はどの特徴量とも相関しない(最大 0.05)= モデルはノイズ下限に到達済み**。
-  特徴量追加では LB は動かない。
-- CV(0.108)と LB(0.122)の 0.014 差は **この train/test 分割固有**で、修正可能な
-  アーティファクトではない(ブレンドを変えても不動)。
-- **LB 0.115 以下は、LB 総当たり(public 過適合)か test 答えの「リーク」が必要**で、
-  純粋な機械学習・正攻法では実用上ここが底。趣味としては十分トップ正攻法の入り口。
-
-## 実績(参考)
-
-| 手法 | CV RMSE(log) | Public LB |
+| 確認項目 | どこで | メモ |
 | --- | --- | --- |
-| XGBoost 単体ベースライン | 0.1275 | 0.12727 |
-| ブレンド + 外れ値除去 + 歪度補正 | 0.1084 | 0.12331 |
-| スタッキング(+ LightGBM) | 0.1083 | 0.12280 |
-| 強い6モデルのブレンド(ENet/KernelRidge 追加) | 0.1080 | 0.12272 |
-| 本格前処理 + 6モデル NNLS ブレンド | 0.1079† | 0.12246 |
-| **fold-safe パイプライン + 収縮ブレンド(現行)** | **0.1079‡** | **0.12236** |
-| (参考)リーク実演 — モデルではない | — | 0.00463 |
+| 締切・残り日数 | `kaggle competitions list` | **間が空くと締切を過ぎる**(ROGII は6月に3回提出後、止まったまま締切) |
+| 賞金・カテゴリ | 同上 | 現金は Featured/Research。Getting Started は賞金なし、Playground は Swag 程度 |
+| 提出方式 | Overview / Code タブ | **コードコンペ**(ノートブック再実行・インターネット不可)か CSV 提出か |
+| 評価指標 | Evaluation タブ、配布資料(pptx 等) | 小さい方が良いのか大きい方か。単位も |
+| ルール | Rules タブ | 外部データ、ブログ公開可否/NDA、チーム、提出回数 |
+| 参加 | ページで Join → 同意 | 未同意だとデータ DL が **403** |
 
-† train/test 結合のため楽観的 / ‡ fold 内 fit の信頼できる CV。NNLS 版は LB 0.12230 で同等。
+候補を出すときは「表形式で手元の型が効くか」「GPU が要るか」「締切まで何週あるか」を並べる。
 
-## 関連ドキュメント / スクリプト
+## 2. 標準ワークフロー
 
-- `docs/note_kaggle_house_prices.md` — 初心者向けの解説記事(スコアの読み方など)。
-- `docs/top_solutions_analysis.md` — 上位者(正攻法トップ／リーク勢)の手法分析。
-- `src/leak_submission.py` — **【リーク実演・教育用】** 外部の Ames 元データで test の
-  正解を引く裏ワザ。LB ≈ 0.00463 になるが**モデルの実力ではない**。データリークを
-  学ぶ教材として用意したもので、正攻法(`train.py`)とは明確に分離している。
-  本来のコンペでは規約違反に当たる点に注意。
+1. **データ点検**: 列、行数、欠損、ID と提出形式。**train と test の列の差**を必ず見る
+   (ROGII では test に地層面の列が無かった = それが本当の難所)。
+2. **評価指標を確定**し、手元で同じ式を実装する。
+3. **test と同じ状況を再現する検証を作る**。行が独立でないなら、まとまり単位で分割する
+   (物件→KFold、坑井・患者・ユーザー→GroupKFold)。前処理の統計量は fold 内で fit する。
+4. **自明なベースラインを測る**(定数、直前値の延長など)。これを超えない改造は無意味。
+5. **上限値(オラクル)を測る**: train にしかない情報を使ったら何点出るか。問題の本質が分かる
+   (ROGII: 地層面を使うと RMSE 0.006 → 地層面を推定する問題だと判明)。
+6. **ドメイン知識で特徴量を作り、GBM に「どれだけ信じるか」を学習させる**
+   (物理的な推定値をそのまま使うと大げさになりがち)。特徴量も OOF(自分を含まない)で作る。
+7. **OOF をキャッシュ**してブレンドや後処理を再学習なしで試す。
+8. 提出 → **CV と LB を比べる**。近ければ検証は健全。大きく離れたらリークか分割の誤りを疑う。
+
+## 3. 原則(実測で確かめた教訓)
+
+- **CV で良くならない変更は採用しない。** 定番テクでも効かないことが多い(HP で多数不採用)。
+- **リークに注意**: train/test を結合した前処理は CV を楽観的にする。外部データで答えを引く
+  「リーク」は実力ではない(HP で実演 0.00463。学習目的の非賞金コンペ以外ではやらない)。
+- **速さは計測してから判断**: 小データの LightGBM は `n_jobs=-1` で激遅(392s→`n_jobs=1` で
+  2.3s)。GPU も同じで、小データなら CPU の方が速いことがある。
+- **引き際**: 残差がどの特徴量とも相関しなければノイズ下限。労力に対して伸びない。
+- **改造の記録**: 何を試して何点だったか(不採用含む)を残す。次のコンペで効く。
+
+## 4. 提出とスコア確認
+
+- CSV 提出: `kaggle competitions submit <slug> -f submission.csv -m "<手法 + CV>"`
+- **コードコンペ / Late Submission**: カーネルを push → 実行完了を待つ → `-k` で提出。
+  手順・注意点は `references/code-competition.md`。
+- スコア: `kaggle competitions submissions -c <slug> | head`
+- 順位: `kaggle competitions leaderboard <slug> --download` は **Public** の順位表。
+  終了後の Private 順位は Web で確認する。
+- 提出は外向きの操作。ユーザーが明示したときだけ行う。
+
+## 5. GPU(Windows PC)を使うとき
+
+クラウドのセッションからは PC の GPU に届かない。GPU 学習は PC 上の Claude Code で回し、
+コード共有は git、データは各自 `kaggle` CLI で取得する。セットアップと役割分担は
+`references/gpu-windows.md`。
+
+## 6. 振り返りの残し方(コンペごと)
+
+コンペが一段落したら `references/lessons-<コンペ名>.md` を作り、以下を書いてこのファイルの
+表に1行足す: データ構造、評価指標、検証方法、試した手法と CV/LB(不採用も)、効いたこと、
+次の課題。コードは `rogii/kernel/` のように残す。
+
+## 7. 過去コンペ
+
+| コンペ | 種類 | 結果 | 詳細 |
+| --- | --- | --- | --- |
+| House Prices | 入門・表形式回帰・CSV 提出 | Public 0.12236(上位16%) | `references/lessons-house-prices.md` |
+| ROGII Wellbore Geology | 賞金$50k・コードコンペ・回帰 | 本番 Private 12.762 → Late 10.470 | `references/lessons-rogii.md` |
+
+再利用できるコード: 表形式テンプレート `src/`(使い方 `docs/TEMPLATE.md`)、
+コードコンペ用カーネル例 `rogii/kernel/rogii_geosteer.py`。
