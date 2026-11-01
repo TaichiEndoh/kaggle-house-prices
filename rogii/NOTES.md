@@ -1,5 +1,21 @@
 # ROGII Wellbore Geology Prediction — 下調べ & 叩き台
 
+## 2026-11 Late Submission の結果(追記)
+
+| 提出 | Public | Private |
+| --- | --- | --- |
+| 2026-06-20(本番中のベスト) | 12.507 | 12.762 |
+| **2026-11-01 Late: 物理特徴 + LightGBM** | **11.746** | **10.470** |
+
+- 評価指標は **RMSE(予測TVTのずれ, ft)** で確定(タスク説明 pptx)。
+- 学習データの地層面(ANCC 等)を使うと RMSE≈0.006 → TVT は「地層面からの高さ」で決まる。
+  test には地層面が無いので、**周辺の学習坑井から地層の傾きを推定**するのが本質。
+- 坑井単位5分割CV: const 15.91 / 近傍IDW 26 / Viterbi(GR照合) ≒const / 0.5×平面dip 13.93 /
+  **物理特徴+LightGBM 11.53**(Public 11.75・Private 10.47 と整合 = CVは信頼できる)。
+- 実装: `rogii/kernel/rogii_geosteer.py`、検証: `rogii/experiments/`。
+- メダル圏(銀〜銅 ≈ 6.3〜6.4)まではまだ距離あり。上位解法の typewell GR 相互相関の取り込みが次の課題。
+- ※以下は本番前(2026-06)に書いた下調べメモ。データ構造などは上記の判明事項が正。
+
 House Prices で作ったテンプレを、賞金付きコンペ
 [ROGII - Wellbore Geology Prediction](https://www.kaggle.com/competitions/rogii-wellbore-geology-prediction)
 ($50,000 / 締切 2026-08-05) に転用するための調査メモと足場(スキャフォールド)。
